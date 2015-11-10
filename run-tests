@@ -1,0 +1,16 @@
+#! /bin/bash
+
+prefix=php
+args=
+for item in $* ;
+do
+    if [ $item == "-V" ] ; then
+        prefix="valgrind php"
+    elif [ $item == "-T" ] ; then
+        prefix="php run-tests.php -p $(which php) --show-diff"
+    else
+        args+=" $item"
+    fi
+done
+
+$prefix -d extension=modules/fiber.so $args
