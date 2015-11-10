@@ -30,6 +30,7 @@ typedef struct _fiber {
     coro_context ctx;
     struct coro_stack stack;
     zval callback;
+    zend_array *params;
     zend_bool started;
     zend_object std;
 }fiber_t;

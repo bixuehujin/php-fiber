@@ -5,6 +5,24 @@ zend_object_handlers fiber_handler_Fiber;
 
 static fiber_t *current_fiber = NULL;
 
+#define array_addref(z)                                 \
+    do {                                                \
+        zend_array *_z1 = (z);                          \
+        zend_refcounted *_gc = (zend_refcounted *)_z1;  \
+        GC_REFCOUNT(_gc)++;                             \
+    } while (0)
+
+#define array_delref(z)                                 \
+    do {                                                \
+        zend_array *_z1 = (z);                          \
+        zend_refcounted *_gc = (zend_refcounted *)_z1;  \
+        GC_REFCOUNT(_gc)--;                             \
+        if (GC_REFCOUNT(_gc) <= 1) {                    \
+           zend_array_destroy(_z1);                     \
+        }                                               \
+    } while(0)
+
+
 static inline fiber_t *fiber_from_obj(zend_object *obj) /* {{{ */ {
     return (fiber_t*)((char*)(obj) - XtOffsetOf(fiber_t, std));
 }
@@ -18,6 +36,7 @@ static zend_object *fiber_object_new(zend_class_entry *ce)
     object_properties_init(&intern->std, ce);
 
     intern->started = 0;
+    intern->params = NULL;
 
     intern->std.handlers = &fiber_handler_Fiber;
 
@@ -28,21 +47,45 @@ static void fiber_object_free(zend_object *object)
 {
     fiber_t *intern = fiber_from_obj(object);
 
+    coro_stack_free(&intern->stack);
+
+    zval_ptr_dtor(&intern->callback);
+    if (intern->params) {
+        array_delref(intern->params);
+    }
 
     zend_object_std_dtor(&intern->std);
 }
 
-static void coro_callback(void *arg)
+static int call_user_function_array(HashTable *function_table, zval *object, zval *function_name, zval *retval_ptr, zval *params)
 {
-    fiber_t *intern = (fiber_t *)arg;
+    zend_fcall_info fci;
+    int retval;
 
+    fci.size = sizeof(fci);
+    fci.function_table = EG(function_table);
+    fci.object = NULL;
+    ZVAL_COPY_VALUE(&fci.function_name, function_name);
+    fci.retval = retval_ptr;;
+    fci.no_separation = (zend_bool) 1;
+    fci.symbol_table = NULL;
+    fci.param_count = 0;
+    fci.params = NULL;
 
+    zend_fcall_info_args(&fci, params);
+
+    retval = zend_call_function(&fci, NULL);
+
+    zend_fcall_info_args_clear(&fci, 1);
+
+    return retval;
 }
 
 FIBER_METHOD(Fiber, __construct) {
     zval *callback;
+    zend_array *params = NULL;
 
-    if (zend_parse_parameters(ZEND_NUM_ARGS(), "z", &callback) == FAILURE) {
+    if (zend_parse_parameters(ZEND_NUM_ARGS(), "z|H", &callback, &params) == FAILURE) {
         return;
     }
 
@@ -54,9 +97,13 @@ FIBER_METHOD(Fiber, __construct) {
     fiber_t *intern = fiber_from_obj(Z_OBJ_P(getThis()));
 
     ZVAL_COPY(&intern->callback, callback);
+    if (params) {
+        array_addref(params);
+        intern->params = params;
+    }
 
     coro_stack_alloc(&intern->stack, 0);
-    coro_create(&intern->ctx, coro_callback, intern, intern->stack.sptr, intern->stack.ssze);
+    coro_create(&intern->ctx, NULL, NULL, intern->stack.sptr, intern->stack.ssze);
 }
 
 FIBER_METHOD(Fiber, switch) {
@@ -72,7 +119,14 @@ FIBER_METHOD(Fiber, switch) {
 
     if (!intern->started) {
         intern->started = 1;
-        call_user_function(EG(function_table), NULL, &intern->callback, &retval, 0, NULL);
+        zval params;
+
+        if (intern->params) {
+            ZVAL_ARR(&params, intern->params);
+            call_user_function_array(EG(function_table), NULL, &intern->callback, &retval, &params);
+        } else {
+            call_user_function(EG(function_table), NULL, &intern->callback, &retval, 0, NULL);
+        }
     } else {
         if (intern != current_fiber) {
             coro_transfer(&current_fiber->ctx, &intern->ctx);
@@ -92,7 +146,8 @@ FIBER_METHOD(Fiber, throw) {
 
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class___construct, 0, 0, 1)
-    ZEND_ARG_INFO(0, callable)
+    ZEND_ARG_INFO(0, callback)
+    ZEND_ARG_INFO(0, params)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO_EX(arginfo_class_switch, 0, 0, 1)
